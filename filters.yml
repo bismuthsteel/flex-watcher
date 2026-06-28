@@ -1,0 +1,19 @@
+# What to watch for. Edit this file, commit, done.
+#   '*'  = any
+#   defaults if you omit them:  fuel: Elektrisch   max_value: 60000
+# 'model' matches as "contains" (so "Ariya" also matches "Ariya 63kWh").
+
+showroom_url: "https://flex.athlon.com/app/showroom"
+
+filters:
+  - brand: Nissan
+    model: Ariya
+
+  - brand: Tesla
+    model: "*"
+    max_value: 55000
+
+  - brand: "*"          # any electric car under 60k
+    model: "*"
+    max_value: 60000
+    fuel: Elektrisch
