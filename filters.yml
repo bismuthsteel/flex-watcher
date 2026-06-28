@@ -1,19 +1,23 @@
 # What to watch for. Edit this file, commit, done.
 #   '*'  = any
 #   defaults if you omit them:  fuel: Elektrisch   max_value: 60000
-# 'model' matches as "contains" (so "Ariya" also matches "Ariya 63kWh").
+# 'model' matches as "contains" and ignores _ vs spaces
+#   (so "Ariya" also matches "Ariya 63kWh", and "AYGO X" == "AYGO_X").
 
-showroom_url: "https://flex.athlon.com/app/showroom"
+# The aanbod (offer) page. Keep the query params — they set the pricing context.
+showroom_url: "https://flex.athlon.com/app/showroom?includeTaxInPrices=false&numberOfKmPerMonth=1000&includeMileageCostsInPricing=true&includeFuelCostsInPricing=true"
 
 filters:
-  - brand: Nissan
-    model: Ariya
-
-  - brand: Tesla
-    model: "*"
-    max_value: 55000
-
-  - brand: "*"          # any electric car under 60k
+  # Any electric car under 60k (your main goal). NOTE: a wildcard brand+model
+  # means every model page gets crawled each run — that's expected.
+  - brand: "*"
     model: "*"
     max_value: 60000
     fuel: Elektrisch
+
+  # Examples of narrower filters (uncomment / edit as you like):
+  # - brand: Nissan
+  #   model: Ariya
+  # - brand: Tesla
+  #   model: "*"
+  #   max_value: 55000

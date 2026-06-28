@@ -1,19 +1,15 @@
 """
 Athlon Flex showroom checker — GitHub Actions edition.
 
-Runs once per invocation (cron triggers it), scrapes the showroom, and sends a
-Telegram message for any NEW car that matches a filter in filters.yml.
+Crawl structure (confirmed):
+    showroom (aanbod)   /app/showroom?...           -> grid of MODELS
+    model page          /app/showroom/Brand/Model    -> grid of CARS
+    detail page         /app/showroom/Brand/Model/<uuid>  -> fuel + fiscale waarde
 
-State (the nulmeting baseline = car UUIDs already seen) lives in state.json,
-which the workflow commits back to the repo so it survives between runs.
+Each run: enumerate every car UUID, alert on NEW ones matching filters.yml.
+State (nulmeting baseline) lives in state.json, committed back by the workflow.
 
-Env vars (set as GitHub Secrets):
-    TG_BOT_TOKEN   required
-    TG_CHAT_ID     required
-
-Files:
-    filters.yml    what to watch for (you edit this)
-    state.json     baseline + seen UUIDs (managed automatically)
+Env (GitHub Secrets): TG_BOT_TOKEN, TG_CHAT_ID
 """
 
 from __future__ import annotations
@@ -26,6 +22,7 @@ import html
 import logging
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 import yaml
@@ -51,8 +48,29 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger("check")
 
-CAR_LINK_RE = re.compile(
-    r"/app/showroom/(?P<brand>[^/]+)/(?P<model>[^/]+)/(?P<id>[0-9a-fA-F-]{16,})")
+# /app/showroom/Brand/Model  (model link)  OR  .../Brand/Model/<uuid>  (car link)
+SHOWROOM_PATH_RE = re.compile(
+    r"/app/showroom/(?P<brand>[^/?#]+)/(?P<model>[^/?#]+)(?:/(?P<uuid>[0-9a-fA-F-]{16,}))?")
+
+
+def norm(s: str) -> str:
+    """Normalise 'AYGO_X' / 'AYGO-X' / 'aygo x' to a common form for matching."""
+    return s.replace("_", " ").replace("-", " ").lower().strip()
+
+
+def deslug(s: str) -> str:
+    return s.replace("_", " ").replace("-", " ").strip()
+
+
+def classify(href: str):
+    """Return ('model', brand, model) | ('car', brand, model, uuid) | None."""
+    m = SHOWROOM_PATH_RE.search(href or "")
+    if not m:
+        return None
+    if m.group("uuid"):
+        return ("car", m.group("brand"), m.group("model"), m.group("uuid"))
+    return ("model", m.group("brand"), m.group("model"), None)
+
 
 # --------------------------------------------------------------------------- #
 # Model
@@ -73,9 +91,9 @@ def matches(car: Car, f: dict) -> bool:
     model = str(f.get("model", "*"))
     fuel  = str(f.get("fuel", DEFAULT_FUEL))
     mx    = int(f.get("max_value", DEFAULT_MAX))
-    if brand != "*" and brand.lower() != car.brand.lower():
+    if brand != "*" and norm(brand) != norm(car.brand):
         return False
-    if model != "*" and model.lower() not in car.model.lower():   # "contains"
+    if model != "*" and norm(model) not in norm(car.model):     # "contains"
         return False
     if car.fuel is not None and fuel.lower() not in car.fuel.lower():
         return False
@@ -84,8 +102,21 @@ def matches(car: Car, f: dict) -> bool:
     return car.fiscal_value < mx
 
 
+def model_of_interest(brand: str, model: str, filters: list[dict]) -> bool:
+    """Should we descend into this model page? (coarse brand/model pre-filter)"""
+    for f in filters:
+        fb = str(f.get("brand", "*"))
+        fm = str(f.get("model", "*"))
+        if fb != "*" and norm(fb) != norm(brand):
+            continue
+        if fm != "*" and norm(fm) not in norm(model):
+            continue
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
-# State (nulmeting baseline)
+# State + filters
 # --------------------------------------------------------------------------- #
 
 def load_state() -> dict:
@@ -143,12 +174,31 @@ def alert(car: Car) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# URL helpers
+# --------------------------------------------------------------------------- #
+
+def absolute(href: str) -> str:
+    if href.startswith("http"):
+        return href
+    return "https://flex.athlon.com" + (href if href.startswith("/") else "/" + href)
+
+
+def with_query(url: str, query: str) -> str:
+    """Append the showroom's query string to a link that lacks one."""
+    p = urlsplit(url)
+    if p.query or not query:
+        return url
+    return urlunsplit((p.scheme, p.netloc, p.path, query, ""))
+
+
+# --------------------------------------------------------------------------- #
 # Scraper (Playwright)
 # --------------------------------------------------------------------------- #
 
 class Scraper:
     def __init__(self, showroom_url: str):
         self.showroom_url = showroom_url
+        self.query = urlsplit(showroom_url).query
         self._pw = self._browser = self._ctx = None
 
     def __enter__(self):
@@ -177,37 +227,98 @@ class Scraper:
             except Exception:
                 continue
 
-    def showroom(self) -> list[Car]:
+    def _links(self, page):
+        # Nudge lazy-loaded grids, then read every showroom link on the page.
+        for _ in range(6):
+            page.mouse.wheel(0, 4000)
+            page.wait_for_timeout(700)
+        return page.eval_on_selector_all(
+            'a[href*="/app/showroom/"]',
+            "els => els.map(e => e.getAttribute('href'))") or []
+
+    def scrape_models(self) -> list[tuple[str, str, str]]:
+        """Return [(brand, model, model_url), ...] from the aanbod grid."""
         from playwright.sync_api import TimeoutError as PWTimeout
         page = self._ctx.new_page()
+        captured: list[tuple[str, str]] = []
+
+        def _on_response(r):
+            try:
+                if "application/json" not in (r.headers.get("content-type", "") or ""):
+                    return
+                snip = ""
+                if any(k in r.url.lower() for k in
+                       ("showroom", "vehicle", "offer", "aanbod", "car",
+                        "catalog", "inventory", "model", "lease", "stock")):
+                    try:
+                        snip = r.text()[:700]
+                    except Exception:
+                        snip = "(body unavailable)"
+                captured.append((r.url, snip))
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
         try:
             page.goto(self.showroom_url, wait_until="networkidle", timeout=60_000)
             self._cookies(page)
             try:
                 page.wait_for_selector('a[href*="/app/showroom/"]', timeout=20_000)
             except PWTimeout:
-                log.warning("No car links appeared.")
-            # If cars lazy-load on scroll, nudge the page a few times.
-            for _ in range(6):
-                page.mouse.wheel(0, 4000)
-                page.wait_for_timeout(800)
-            hrefs = page.eval_on_selector_all(
-                'a[href*="/app/showroom/"]',
-                "els => els.map(e => e.getAttribute('href'))")
+                pass
+            hrefs = self._links(page)
+            title, cur = page.title(), page.url
+        finally:
+            page.close()
+
+        # Log backend JSON endpoints + a body snippet for the promising ones.
+        # (Lets us switch from DOM-crawl to a fast direct API call.)
+        for u, snip in captured[:20]:
+            log.info("api seen: %s", u)
+            if snip:
+                log.info("   body: %s", snip.replace("\n", " "))
+
+        models: dict[tuple[str, str], tuple[str, str, str]] = {}
+        for href in hrefs:
+            c = classify(href)
+            if not c:
+                continue
+            kind, brand, model = c[0], c[1], c[2]
+            # On the aanbod grid we want model links; car links also fine but rare here.
+            url = with_query(absolute(href), self.query)
+            models[(norm(brand), norm(model))] = (deslug(brand), deslug(model), url)
+
+        if not models:
+            body = ""
+            log.warning("No model links found. title=%r final_url=%r", title, cur)
+            low = (title or "").lower()
+            if any(w in low for w in ("inloggen", "login", "aanmelden", "sign in")):
+                log.warning(">>> Looks like a LOGIN wall — showroom may need auth.")
+        log.info("Aanbod: %d distinct models found.", len(models))
+        return list(models.values())
+
+    def scrape_cars(self, model_url: str) -> list[Car]:
+        """Return the individual cars (with uuid) listed on a model page."""
+        from playwright.sync_api import TimeoutError as PWTimeout
+        page = self._ctx.new_page()
+        try:
+            page.goto(model_url, wait_until="networkidle", timeout=45_000)
+            self._cookies(page)
+            try:
+                page.wait_for_selector('a[href*="/app/showroom/"]', timeout=12_000)
+            except PWTimeout:
+                pass
+            hrefs = self._links(page)
         finally:
             page.close()
 
         cars: dict[str, Car] = {}
-        for href in hrefs or []:
-            m = CAR_LINK_RE.search(href or "")
-            if not m:
+        for href in hrefs:
+            c = classify(href)
+            if not c or c[0] != "car":
                 continue
-            cid = m.group("id")
-            cars[cid] = Car(cid,
-                            m.group("brand").replace("-", " ").strip(),
-                            m.group("model").replace("-", " ").strip(),
-                            _abs(href))
-        log.info("Showroom: %d distinct cars found.", len(cars))
+            _, brand, model, uuid = c
+            cars[uuid] = Car(uuid, deslug(brand), deslug(model), absolute(href))
         return list(cars.values())
 
     def detail(self, car: Car) -> Car:
@@ -229,11 +340,6 @@ class Scraper:
                  car.brand, car.model, car.fuel, car.fiscal_value)
         return car
 
-
-def _abs(href: str) -> str:
-    if href.startswith("http"):
-        return href
-    return "https://flex.athlon.com" + (href if href.startswith("/") else "/" + href)
 
 def _field(text: str, label: str) -> Optional[str]:
     m = re.search(rf"{re.escape(label)}\s*[:\n]?\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
@@ -260,17 +366,33 @@ def main() -> int:
     seen = set(state["seen"])
 
     with Scraper(showroom_url) as s:
-        cars = s.showroom()
+        models = s.scrape_models()
 
-        # SAFETY GUARD: a 0-car scrape means the site changed or blocked us.
+        # SAFETY GUARD: 0 models means the site changed / blocked / needs login.
         # Do NOT touch state, or the next run would treat everything as "new".
-        if not cars:
-            log.error("Scraped 0 cars — leaving state untouched and exiting.")
+        if not models:
+            log.error("Scraped 0 models — leaving state untouched and exiting.")
+            return 1
+
+        interesting = [m for m in models if model_of_interest(m[0], m[1], filters)]
+        log.info("%d/%d models match your filters' brand/model; crawling those.",
+                 len(interesting), len(models))
+
+        cars: dict[str, Car] = {}
+        for brand, model, url in interesting:
+            for car in s.scrape_cars(url):
+                cars[car.id] = car
+        log.info("Total cars enumerated: %d", len(cars))
+
+        # If brand/model matched models but we got no cars at all, treat as a
+        # scrape failure (don't corrupt the baseline).
+        if interesting and not cars:
+            log.error("Models matched but 0 cars enumerated — exiting without state change.")
             return 1
 
         # --- nulmeting: first run records everything, alerts nothing --------
         if not state["baseline_done"]:
-            state["seen"] = sorted({c.id for c in cars})
+            state["seen"] = sorted(cars.keys())
             state["baseline_done"] = True
             save_state(state)
             send(f"✅ <b>Nulmeting voltooid.</b>\nIk volg nu {len(cars)} auto's. "
@@ -279,7 +401,7 @@ def main() -> int:
             return 0
 
         # --- normal run: evaluate only unseen cars --------------------------
-        new = [c for c in cars if c.id not in seen]
+        new = [c for c in cars.values() if c.id not in seen]
         log.info("%d new car(s) since last run.", len(new))
         alerts = 0
         for c in new:
