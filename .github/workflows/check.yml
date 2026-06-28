@@ -1,0 +1,76 @@
+name: flex-check
+
+on:
+  schedule:
+    # GitHub cron is UTC. This fires every 15 min across 06:00-17:45 UTC, Mon-Fri,
+    # which covers 08:30-18:00 Amsterdam time in BOTH winter (UTC+1) and summer
+    # (UTC+2). The "business-hours gate" step below trims it to the exact local
+    # window (so a handful of edge fires just no-op in ~3s), and handles DST with
+    # no yearly edits.
+    - cron: "*/15 6-17 * * 1-5"
+  workflow_dispatch: {}        # manual runs are ALWAYS allowed (ignore the gate)
+
+concurrency:
+  group: flex-check
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Business-hours gate (Europe/Amsterdam, Mon-Fri 08:30-18:00)
+        id: window
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Europe/Amsterdam"))
+          start = now.replace(hour=8,  minute=30, second=0, microsecond=0)
+          end   = now.replace(hour=18, minute=0,  second=0, microsecond=0)
+          inside = now.weekday() < 5 and start <= now <= end
+          print(f"Now (Amsterdam): {now:%a %Y-%m-%d %H:%M %Z} -> "
+                f"{'INSIDE window' if inside else 'OUTSIDE window (skip)'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"inside={'true' if inside else 'false'}\n")
+          PY
+
+      - name: Set up Python
+        if: steps.window.outputs.inside == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.window.outputs.inside == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run check
+        if: steps.window.outputs.inside == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+        run: python check.py
+
+      - name: Persist baseline state
+        if: ${{ always() && (steps.window.outputs.inside == 'true' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          git config user.name  "flexbot"
+          git config user.email "flexbot@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "No state change."
+          else
+            git commit -m "update baseline state [skip ci]"
+            git pull --rebase --autostash
+            git push
+          fi
